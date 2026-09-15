@@ -1,6 +1,8 @@
 require("dotenv").config();
 const connectDB = require("./config/db");
 
+const redisConnection = require("./config/redis");
+
 const express = require("express");
 
 const healthRoutes = require("./routes/health");
