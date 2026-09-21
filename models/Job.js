@@ -21,6 +21,11 @@ const jobSchema = new mongoose.Schema({
         default: 0
     },
 
+    errorMessage: {
+    type: String,
+    default: null
+},
+
     isCachedResult: {
         type: Boolean,
         default: false

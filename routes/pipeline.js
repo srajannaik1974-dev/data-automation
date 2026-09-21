@@ -34,11 +34,21 @@ router.post("/process", async (req, res) => {
             status: "pending"
         });
 
-        const bullJob = await pipelineQueue.add("process-data", {
-            jobId: job._id.toString(),
-            userId: user._id.toString(),
-            input
-        });
+        const bullJob = await pipelineQueue.add(
+    "process-data",
+    {
+        jobId: job._id.toString(),
+        userId: user._id.toString(),
+        input
+    },
+    {
+        attempts: 3,
+        backoff: {
+            type: "exponential",
+            delay: 2000
+        }
+    }
+);
 
         job.bullJobId = bullJob.id;
         await job.save();
