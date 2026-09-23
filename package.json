@@ -17,6 +17,8 @@
     "express": "^5.2.1",
     "groq-sdk": "^1.6.0",
     "ioredis": "^6.0.0",
-    "mongoose": "^9.9.5"
+    "mongoose": "^9.9.5",
+    "multer": "^2.4.0",
+    "pdf-parse": "^2.4.5"
   }
 }
