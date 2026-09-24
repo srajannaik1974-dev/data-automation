@@ -4,9 +4,13 @@ const { Worker } = require("bullmq");
 const redisConnection = require("./config/redis");
 const connectDB = require("./config/db");
 const Job = require("./models/Job");
+const PageContent = require("./models/PageContent");
+const Document = require("./models/Document");
 
 const Groq = require("groq-sdk");
 const crypto = require("crypto");
+const fs = require("fs");
+const { PDFParse } = require("pdf-parse");
 
 const groq = new Groq({
     apiKey: process.env.GROQ_API_KEY
@@ -18,6 +22,52 @@ const startWorker = async () => {
     const worker = new Worker(
         "data-automation",
         async (job) => {
+             if (job.name === "process-pdf") {
+            console.log("Processing PDF job:", job.id);
+
+            const { documentId, filePath } = job.data;
+            await Document.findByIdAndUpdate(documentId, {
+    status: "processing"
+});
+
+            console.log("Document ID:", documentId);
+            console.log("PDF path:", filePath);
+
+            const pdfBuffer = fs.readFileSync(filePath);
+
+            const parser = new PDFParse({
+                data: pdfBuffer
+            });
+
+       const result = await parser.getText();
+
+console.log("PDF pages:", result.total);
+console.log("PDF text length:", result.text.length);
+
+for (let i = 0; i < result.pages.length; i++) {
+    const page = result.pages[i];
+
+    await PageContent.create({
+        documentId: documentId,
+        pageNumber: i + 1,
+        text: page.text
+    });
+
+    console.log(`Saved page ${i + 1}`);
+}
+await Document.findByIdAndUpdate(documentId, {
+    status: "completed",
+    totalPages: result.total
+});
+
+await parser.destroy();
+
+            return {
+                success: true,
+                type: "pdf",
+                pages: result.total
+            };
+        }
             console.log("Processing job:", job.id);
             console.log("Job data:", job.data);
 

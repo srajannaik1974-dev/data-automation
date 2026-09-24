@@ -1,6 +1,7 @@
 const express = require("express");
 const multer = require("multer");
 const Document = require("../models/Document");
+const pipelineQueue = require("../queues/pipelineQueue");
 
 const router = express.Router();
 
@@ -23,6 +24,10 @@ router.post("/upload", upload.single("pdf"), async (req, res) => {
             mimeType: req.file.mimetype,
             fileSize: req.file.size
         });
+        await pipelineQueue.add("process-pdf", {
+    documentId: document._id.toString(),
+    filePath: req.file.path
+});
 
         res.status(201).json({
             message: "PDF uploaded successfully",
