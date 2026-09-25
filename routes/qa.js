@@ -20,22 +20,74 @@ const { documentId, question } = req.body || {};
             });
         }
 
-        const words = question
-            .toLowerCase()
-            .split(/\s+/)
-            .filter(word => word.length > 2);
+       const stopWords = new Set([
+    "what",
+    "are",
+    "the",
+    "is",
+    "a",
+    "an",
+    "of",
+    "for",
+    "to",
+    "in",
+    "on",
+    "and",
+    "or",
+    "how",
+    "why",
+    "who",
+    "where",
+    "when"
+]);
+
+const words = question
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(word => word.length > 2 && !stopWords.has(word));
 
         const chunks = await Chunk.find({
-            documentId: documentId,
-            $or: words.map(word => ({
-                text: {
-                    $regex: word,
-                    $options: "i"
-                }
-            }))
-        }).limit(5);
-       
-       const context = chunks
+    documentId: documentId,
+    $or: words.map(word => ({
+        text: {
+            $regex: word,
+            $options: "i"
+        }
+    }))
+});
+
+const scoredChunks = chunks
+    .map(chunk => {
+        const text = chunk.text.toLowerCase();
+
+       const score = words.reduce((total, word) => {
+    if (word === "objectives") {
+        return total + (text.includes(word) ? 5 : 0);
+    }
+
+    return total + (text.includes(word) ? 1 : 0);
+}, 0);
+
+        return {
+            chunk,
+            score
+        };
+    })
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5)
+    .map(item => item.chunk);
+
+       console.log(
+    "Scored chunks:",
+    scoredChunks.map(chunk => ({
+        page: chunk.pageNumber,
+        chunk: chunk.chunkIndex,
+        text: chunk.text.substring(0, 100)
+    }))
+);
+
+     const context = scoredChunks
     .map(chunk => `Page ${chunk.pageNumber}:\n${chunk.text}`)
     .join("\n\n");
 
@@ -79,7 +131,7 @@ if (!answer) {
 }
 
 const sourcePages = [
-    ...new Set(chunks.map(chunk => chunk.pageNumber))
+    ...new Set(scoredChunks.map(chunk => chunk.pageNumber))
 ];
 
 res.json({

@@ -19,6 +19,8 @@
     "ioredis": "^6.0.0",
     "mongoose": "^9.9.5",
     "multer": "^2.4.0",
-    "pdf-parse": "^2.4.5"
+    "pdf-parse": "^2.4.5",
+    "pdfjs-dist": "^5.4.296",
+    "pngjs": "^7.0.0"
   }
 }
