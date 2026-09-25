@@ -6,6 +6,7 @@ const connectDB = require("./config/db");
 const Job = require("./models/Job");
 const PageContent = require("./models/PageContent");
 const Document = require("./models/Document");
+const Chunk = require("./models/Chunk");
 
 const Groq = require("groq-sdk");
 const crypto = require("crypto");
@@ -54,6 +55,42 @@ for (let i = 0; i < result.pages.length; i++) {
     });
 
     console.log(`Saved page ${i + 1}`);
+}
+await Chunk.deleteMany({
+    documentId: documentId
+});
+
+console.log("Old chunks deleted");
+const chunkSize = 500;
+const overlap = 100;
+
+for (let i = 0; i < result.pages.length; i++) {
+    const page = result.pages[i];
+
+    let start = 0;
+    let chunkIndex = 0;
+
+    while (start < page.text.length) {
+
+        const chunkText = page.text.slice(
+            start,
+            start + chunkSize
+        );
+
+        await Chunk.create({
+            documentId: documentId,
+            pageNumber: i + 1,
+            chunkIndex: chunkIndex,
+            text: chunkText
+        });
+
+        console.log(
+            `Saved chunk ${chunkIndex} from page ${i + 1}`
+        );
+
+        start += chunkSize - overlap;
+        chunkIndex++;
+    }
 }
 await Document.findByIdAndUpdate(documentId, {
     status: "completed",

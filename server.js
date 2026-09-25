@@ -13,6 +13,8 @@ const pdfRoutes = require("./routes/pdf");
 
 const app = express();
 
+const qaRoutes = require("./routes/qa");
+
 app.use(express.json());
 
 app.use("/", healthRoutes);
@@ -20,6 +22,8 @@ app.use("/", healthRoutes);
 app.use("/api/pipeline", pipelineRoutes);
 
 app.use("/api/pdf", pdfRoutes);
+
+app.use("/api/qa", qaRoutes);
 
 const PORT = 5000;
 
