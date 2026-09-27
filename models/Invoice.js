@@ -77,6 +77,56 @@ const invoiceSchema = new mongoose.Schema(
             ]
         },
 
+        // --- Human Review ---
+        review: {
+            status: {
+                type: String,
+                enum: ["pending", "in_review", "approved", "rejected"],
+                default: "pending"
+            },
+            reviewedBy: {
+                type: mongoose.Schema.Types.ObjectId,
+                ref: "User",
+                default: null
+            },
+            reviewedAt: {
+                type: Date,
+                default: null
+            },
+            notes: {
+                type: String,
+                default: null
+            },
+            corrections: {
+                invoiceNumber: { type: String, default: null },
+                vendor: { type: String, default: null },
+                date: { type: String, default: null },
+                tax: { type: Number, default: null },
+                total: { type: Number, default: null },
+                lineItems: { type: mongoose.Schema.Types.Mixed, default: null }
+            },
+            validation: {
+                isValid: { type: Boolean, default: true },
+                missingFields: { type: [String], default: [] },
+                errors: {
+                    type: [{
+                        field: String,
+                        code: String,
+                        message: String
+                    }],
+                    default: []
+                },
+                warnings: {
+                    type: [{
+                        field: String,
+                        code: String,
+                        message: String
+                    }],
+                    default: []
+                }
+            }
+        },
+
         // --- Workflow status ---
         status: {
             type: String,
