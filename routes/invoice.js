@@ -478,5 +478,82 @@ router.post("/:invoiceId/review/reject", async (req, res) => {
         return res.status(500).json({ message: "Failed to reject invoice" });
     }
 });
+// ---------------------------------------------------------------------------
+// GET /api/invoice/:invoiceId/export/json
+// Exports the approved invoice as JSON.
+// ---------------------------------------------------------------------------
+router.get("/:invoiceId/export/json", async (req, res) => {
+    try {
+        const { invoiceId } = req.params;
+        const { download } = req.query;
+
+        if (!mongoose.Types.ObjectId.isValid(invoiceId)) {
+            return res.status(400).json({ message: "Invalid invoiceId" });
+        }
+
+        const invoice = await Invoice.findById(invoiceId).lean();
+        if (!invoice) {
+            return res.status(404).json({ message: "Invoice not found" });
+        }
+
+        if (!invoice.review || invoice.review.status !== "approved") {
+            return res.status(409).json({ message: "Invoice must be approved before export." });
+        }
+
+        const buildFieldAudit = (fieldName) => {
+            const isCorrected = invoice.review.corrections[fieldName] !== null && invoice.review.corrections[fieldName] !== undefined;
+            return {
+                originalAiValue: invoice[fieldName].value,
+                isCorrected,
+                evidence: invoice[fieldName].evidence,
+                page: invoice[fieldName].page
+            };
+        };
+
+        const effectiveData = {
+            invoiceNumber: invoice.review.corrections.invoiceNumber !== null && invoice.review.corrections.invoiceNumber !== undefined ? invoice.review.corrections.invoiceNumber : invoice.invoiceNumber.value,
+            vendor: invoice.review.corrections.vendor !== null && invoice.review.corrections.vendor !== undefined ? invoice.review.corrections.vendor : invoice.vendor.value,
+            date: invoice.review.corrections.date !== null && invoice.review.corrections.date !== undefined ? invoice.review.corrections.date : invoice.date.value,
+            tax: invoice.review.corrections.tax !== null && invoice.review.corrections.tax !== undefined ? invoice.review.corrections.tax : invoice.tax.value,
+            total: invoice.review.corrections.total !== null && invoice.review.corrections.total !== undefined ? invoice.review.corrections.total : invoice.total.value,
+            lineItems: invoice.review.corrections.lineItems !== null && invoice.review.corrections.lineItems !== undefined ? invoice.review.corrections.lineItems : invoice.lineItems
+        };
+
+        const exportJson = {
+            invoiceId: invoice._id,
+            documentId: invoice.documentId,
+            data: effectiveData,
+            audit: {
+                status: invoice.review.status,
+                reviewedBy: invoice.review.reviewedBy,
+                reviewedAt: invoice.review.reviewedAt,
+                notes: invoice.review.notes,
+                fields: {
+                    invoiceNumber: buildFieldAudit("invoiceNumber"),
+                    vendor: buildFieldAudit("vendor"),
+                    date: buildFieldAudit("date"),
+                    tax: buildFieldAudit("tax"),
+                    total: buildFieldAudit("total"),
+                    lineItems: {
+                        isCorrected: invoice.review.corrections.lineItems !== null && invoice.review.corrections.lineItems !== undefined
+                    }
+                },
+                validation: {
+                    isValid: invoice.review.validation.isValid,
+                    warnings: invoice.review.validation.warnings || []
+                }
+            }
+        };
+
+        if (download === "true") {
+            res.setHeader("Content-Disposition", `attachment; filename="invoice-${invoice._id}.json"`);
+        }
+
+        return res.status(200).json(exportJson);
+    } catch (error) {
+        console.error("Export invoice JSON error:", error.message);
+        return res.status(500).json({ message: "Failed to export invoice as JSON" });
+    }
+});
 
 module.exports = router;
