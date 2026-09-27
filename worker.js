@@ -8,6 +8,7 @@ const PageContent = require("./models/PageContent");
 const Document = require("./models/Document");
 const Chunk = require("./models/Chunk");
 const PageImage = require("./models/PageImage");
+const Invoice = require("./models/Invoice");
 const path = require("path");
 const { PNG } = require("pngjs");
 
@@ -265,6 +266,317 @@ await parser.destroy();
                 pages: result.total
             };
         }
+
+        // -----------------------------------------------------------------
+        // process-invoice — Invoice-specific AI extraction
+        // -----------------------------------------------------------------
+        if (job.name === "process-invoice") {
+            console.log("Processing invoice job:", job.id);
+
+            const { jobId, invoiceId, documentId, userId } = job.data;
+
+            await Job.findByIdAndUpdate(jobId, { status: "processing" });
+
+            // 1. Verify the document exists
+            const document = await Document.findById(documentId).lean();
+            if (!document) {
+                throw new Error(`Document not found: ${documentId}`);
+            }
+
+            // 2. Load page text in page order (cap at 30 pages to avoid
+            //    exceeding Groq context limits on very large PDFs)
+            const PAGE_CAP = 30;
+            const pageContents = await PageContent.find({ documentId })
+                .sort({ pageNumber: 1 })
+                .limit(PAGE_CAP)
+                .lean();
+
+            if (!pageContents || pageContents.length === 0) {
+                throw new Error(
+                    `No page content found for document: ${documentId}. ` +
+                    "Ensure the PDF was processed first."
+                );
+            }
+
+            // 3. Assemble context — prepend page numbers so AI can cite them
+            const fullText = pageContents
+                .map(p => `--- Page ${p.pageNumber} ---\n${p.text}`)
+                .join("\n\n");
+
+            // 4. Redis cache check with invoice-specific namespace
+            const textHash = crypto
+                .createHash("sha256")
+                .update(fullText)
+                .digest("hex");
+            const cacheKey = `ai:invoice:${textHash}`;
+
+            console.log("Invoice cache key:", cacheKey);
+
+            const cachedResult = await redisConnection.get(cacheKey);
+
+            let invoiceFields;
+
+            if (cachedResult) {
+                console.log("Invoice cache HIT");
+                invoiceFields = JSON.parse(cachedResult);
+
+                await Job.findByIdAndUpdate(jobId, { isCachedResult: true });
+            } else {
+                console.log("Invoice cache MISS — sending to Groq...");
+
+                const invoiceSchema = {
+                    invoiceNumber: "string",
+                    invoiceNumber_evidence: "string",
+                    vendor: "string",
+                    vendor_evidence: "string",
+                    date: "date",
+                    date_evidence: "string",
+                    tax: "number",
+                    tax_evidence: "string",
+                    total: "number",
+                    total_evidence: "string",
+                    lineItems: "array"
+                };
+
+                const response = await groq.chat.completions.create({
+                    model: "openai/gpt-oss-20b",
+                    messages: [
+                        {
+                            role: "user",
+                            content:
+`Extract invoice information from the text below according to the following schema.
+
+Schema:
+${JSON.stringify(invoiceSchema, null, 2)}
+
+Rules:
+- Return ONLY valid JSON — no markdown, no code fences, no explanations.
+- Use the exact field names from the schema.
+- If a value is not present in the text, return null for that field.
+- For each main field, extract a corresponding _evidence field containing the EXACT substring from the text that justifies the value.
+- Do not invent evidence. It must be an exact substring. If not found, return null for the evidence.
+- For lineItems, return an array of objects with fields: description, quantity, unitPrice, amount.
+- Do not invent information.
+- For date fields, return an ISO 8601 date string (YYYY-MM-DD) or null.
+
+Document text:
+${fullText}`
+                        }
+                    ]
+                });
+
+                const content = response?.choices?.[0]?.message?.content;
+
+                if (!content) {
+                    throw new Error("Groq returned an empty response for invoice extraction");
+                }
+
+                // Strip accidental markdown code fences if the model adds them
+                const cleaned = content
+                    .replace(/^```(?:json)?\s*/i, "")
+                    .replace(/\s*```$/i, "")
+                    .trim();
+
+                try {
+                    invoiceFields = JSON.parse(cleaned);
+                } catch (parseErr) {
+                    console.error("Invalid JSON from Groq:", cleaned);
+                    throw new Error("Groq returned invalid JSON for invoice extraction");
+                }
+
+                // 5. Validate against the invoice schema (reuse existing fn)
+                validateExtractedDataAgainstSchema(invoiceFields, invoiceSchema);
+
+                // 6. Cache the validated result for 24 hours
+                await redisConnection.set(
+                    cacheKey,
+                    JSON.stringify(invoiceFields),
+                    "EX",
+                    86400
+                );
+
+                console.log("Invoice result cached");
+            }
+
+            console.log("Invoice fields flat:", invoiceFields);
+            
+            // Helper to map flat field to nested structure with page tracking
+            const mapField = (fieldName) => {
+                const value = invoiceFields[fieldName] ?? null;
+                let evidence = invoiceFields[`${fieldName}_evidence`] ?? null;
+                let page = null;
+                
+                if (value !== null && evidence) {
+                    // Try to find the exact evidence string in the pageContents
+                    const evidenceLower = evidence.toLowerCase().trim();
+                    if (evidenceLower) {
+                        for (const p of pageContents) {
+                            if (p.text && p.text.toLowerCase().includes(evidenceLower)) {
+                                page = p.pageNumber;
+                                break;
+                            }
+                        }
+                    }
+                    if (page === null) {
+                        // Evidence not found in text
+                        evidence = null;
+                    }
+                } else {
+                    evidence = null;
+                }
+                
+                return { value, page, evidence };
+            };
+            
+            const nestedInvoice = {
+                invoiceNumber: mapField("invoiceNumber"),
+                vendor: mapField("vendor"),
+                date: mapField("date"),
+                tax: mapField("tax"),
+                total: mapField("total"),
+                lineItems: invoiceFields.lineItems ?? []
+            };
+
+            // 6.5 Deterministic Validation
+            const validation = {
+                isValid: true,
+                missingFields: [],
+                errors: [],
+                warnings: []
+            };
+
+            const reqFields = ["invoiceNumber", "vendor", "date", "total"];
+            for (const f of reqFields) {
+                if (nestedInvoice[f].value === null || nestedInvoice[f].value === undefined) {
+                    validation.missingFields.push(f);
+                    validation.errors.push({
+                        field: f,
+                        code: "MISSING_REQUIRED_FIELD",
+                        message: `Required invoice field '${f}' is missing.`
+                    });
+                }
+            }
+
+            const totalVal = nestedInvoice.total.value;
+            const taxVal = nestedInvoice.tax.value;
+
+            if (totalVal !== null && totalVal < 0) {
+                validation.errors.push({
+                    field: "total",
+                    code: "NEGATIVE_TOTAL",
+                    message: "Invoice total cannot be negative."
+                });
+            }
+
+            if (taxVal !== null && taxVal < 0) {
+                validation.errors.push({
+                    field: "tax",
+                    code: "NEGATIVE_TAX",
+                    message: "Invoice tax cannot be negative."
+                });
+            }
+
+            if (taxVal !== null && totalVal !== null && taxVal > totalVal) {
+                validation.errors.push({
+                    field: "tax",
+                    code: "TAX_EXCEEDS_TOTAL",
+                    message: "Invoice tax cannot be greater than the invoice total."
+                });
+            }
+
+            let allAmountsPresent = true;
+            let sumAmounts = 0;
+            const hasLineItems = nestedInvoice.lineItems && nestedInvoice.lineItems.length > 0;
+
+            if (hasLineItems) {
+                nestedInvoice.lineItems.forEach((li, idx) => {
+                    const q = li.quantity;
+                    const u = li.unitPrice;
+                    const a = li.amount;
+
+                    if (q !== null && q !== undefined && u !== null && u !== undefined && a !== null && a !== undefined) {
+                        const calcAmount = Math.round(q * u * 100);
+                        const expectedAmount = Math.round(a * 100);
+                        if (calcAmount !== expectedAmount) {
+                            validation.errors.push({
+                                field: `lineItems[${idx}]`,
+                                code: "LINE_ITEM_AMOUNT_MISMATCH",
+                                message: "Line item amount does not equal quantity multiplied by unit price."
+                            });
+                        }
+                    } else {
+                        validation.warnings.push({
+                            field: `lineItems[${idx}]`,
+                            code: "INCOMPLETE_LINE_ITEM",
+                            message: "Line item could not be fully validated because quantity, unit price, or amount is missing."
+                        });
+                    }
+
+                    if (a === null || a === undefined) {
+                        allAmountsPresent = false;
+                    } else {
+                        sumAmounts += Math.round(a * 100);
+                    }
+                });
+            }
+
+            if (hasLineItems && totalVal !== null) {
+                if (taxVal === null || taxVal === undefined) {
+                    validation.warnings.push({
+                        field: "tax",
+                        code: "TAX_UNAVAILABLE_FOR_CALCULATION",
+                        message: "Tax was not available, so tax-dependent total validation could not be completed."
+                    });
+                } else if (!allAmountsPresent) {
+                    validation.warnings.push({
+                        field: "total",
+                        code: "TOTAL_CALCULATION_UNAVAILABLE",
+                        message: "One or more line item amounts are missing, so tax-dependent total validation could not be completed."
+                    });
+                } else {
+                    const expectedTotal = Math.round(totalVal * 100);
+                    const calcTotal = sumAmounts + Math.round(taxVal * 100);
+                    if (calcTotal !== expectedTotal) {
+                        validation.errors.push({
+                            field: "total",
+                            code: "TOTAL_MISMATCH",
+                            message: "Sum of line items plus tax does not match the extracted invoice total."
+                        });
+                    }
+                }
+            }
+
+            validation.isValid = validation.errors.length === 0;
+            nestedInvoice.validation = validation;
+
+            // 7. Persist the structured invoice
+            await Invoice.findByIdAndUpdate(invoiceId, {
+                invoiceNumber: nestedInvoice.invoiceNumber,
+                vendor:        nestedInvoice.vendor,
+                date:          nestedInvoice.date,
+                tax:           nestedInvoice.tax,
+                total:         nestedInvoice.total,
+                lineItems:     nestedInvoice.lineItems,
+                validation:    nestedInvoice.validation,
+                status:        "extracted"
+            });
+
+            // 8. Mark the Job complete and store extractedData
+            await Job.findByIdAndUpdate(jobId, {
+                status: "completed",
+                extractedData: nestedInvoice,
+                isCachedResult: cachedResult ? true : false
+            });
+
+            console.log("Invoice extraction complete for invoiceId:", invoiceId);
+
+            return {
+                success: true,
+                type: "invoice",
+                invoiceId
+            };
+        }
+
             console.log("Processing job:", job.id);
             console.log("Job data:", job.data);
 

@@ -15,6 +15,8 @@ const app = express();
 
 const qaRoutes = require("./routes/qa");
 
+const invoiceRoutes = require("./routes/invoice");
+
 app.use(express.json());
 
 app.use("/", healthRoutes);
@@ -24,6 +26,8 @@ app.use("/api/pipeline", pipelineRoutes);
 app.use("/api/pdf", pdfRoutes);
 
 app.use("/api/qa", qaRoutes);
+
+app.use("/api/invoice", invoiceRoutes);
 
 const PORT = 5000;
 
