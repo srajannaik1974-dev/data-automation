@@ -555,5 +555,99 @@ router.get("/:invoiceId/export/json", async (req, res) => {
         return res.status(500).json({ message: "Failed to export invoice as JSON" });
     }
 });
+// ---------------------------------------------------------------------------
+// GET /api/invoice/:invoiceId/export/csv
+// Exports the approved invoice as CSV.
+// ---------------------------------------------------------------------------
+router.get("/:invoiceId/export/csv", async (req, res) => {
+    try {
+        const { invoiceId } = req.params;
+        const { download } = req.query;
+
+        if (!mongoose.Types.ObjectId.isValid(invoiceId)) {
+            return res.status(400).json({ message: "Invalid invoiceId" });
+        }
+
+        const invoice = await Invoice.findById(invoiceId).lean();
+        if (!invoice) {
+            return res.status(404).json({ message: "Invoice not found" });
+        }
+
+        if (!invoice.review || invoice.review.status !== "approved") {
+            return res.status(409).json({ message: "Invoice must be approved before export." });
+        }
+
+        const effectiveData = {
+            invoiceNumber: invoice.review.corrections.invoiceNumber !== null && invoice.review.corrections.invoiceNumber !== undefined ? invoice.review.corrections.invoiceNumber : invoice.invoiceNumber.value,
+            vendor: invoice.review.corrections.vendor !== null && invoice.review.corrections.vendor !== undefined ? invoice.review.corrections.vendor : invoice.vendor.value,
+            date: invoice.review.corrections.date !== null && invoice.review.corrections.date !== undefined ? invoice.review.corrections.date : invoice.date.value,
+            tax: invoice.review.corrections.tax !== null && invoice.review.corrections.tax !== undefined ? invoice.review.corrections.tax : invoice.tax.value,
+            total: invoice.review.corrections.total !== null && invoice.review.corrections.total !== undefined ? invoice.review.corrections.total : invoice.total.value,
+            lineItems: invoice.review.corrections.lineItems !== null && invoice.review.corrections.lineItems !== undefined ? invoice.review.corrections.lineItems : invoice.lineItems
+        };
+
+        const escapeCSV = (val) => {
+            if (val === null || val === undefined) return "";
+            const str = String(val);
+            if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+                return `"${str.replace(/"/g, '""')}"`;
+            }
+            return str;
+        };
+
+        const headers = [
+            "Invoice ID",
+            "Invoice Number",
+            "Vendor",
+            "Date",
+            "Tax",
+            "Total",
+            "Item Description",
+            "Quantity",
+            "Unit Price",
+            "Amount"
+        ];
+
+        let csvLines = [headers.map(escapeCSV).join(",")];
+
+        const baseRow = [
+            invoice._id.toString(),
+            effectiveData.invoiceNumber,
+            effectiveData.vendor,
+            effectiveData.date,
+            effectiveData.tax,
+            effectiveData.total
+        ];
+
+        let lineItems = effectiveData.lineItems;
+        if (!Array.isArray(lineItems) || lineItems.length === 0) {
+            // One row with empty line item columns
+            const row = [...baseRow, "", "", "", ""];
+            csvLines.push(row.map(escapeCSV).join(","));
+        } else {
+            for (const item of lineItems) {
+                const desc = item.description || item.item || "";
+                const qty = item.quantity !== undefined && item.quantity !== null ? item.quantity : "";
+                const price = item.unitPrice !== undefined && item.unitPrice !== null ? item.unitPrice : "";
+                const amt = item.amount !== undefined && item.amount !== null ? item.amount : "";
+
+                const row = [...baseRow, desc, qty, price, amt];
+                csvLines.push(row.map(escapeCSV).join(","));
+            }
+        }
+
+        const csvContent = csvLines.join("\r\n");
+
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        if (download === "true") {
+            res.setHeader("Content-Disposition", `attachment; filename="invoice-${invoice._id}.csv"`);
+        }
+
+        return res.status(200).send(csvContent);
+    } catch (error) {
+        console.error("Export invoice CSV error:", error.message);
+        return res.status(500).json({ message: "Failed to export invoice as CSV" });
+    }
+});
 
 module.exports = router;
