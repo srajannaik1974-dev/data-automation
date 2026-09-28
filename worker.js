@@ -12,6 +12,7 @@ const Invoice = require("./models/Invoice");
 const path = require("path");
 const { PNG } = require("pngjs");
 const { validateInvoiceData } = require("./utils/invoiceValidator");
+const { getNormalizedIdentityKey } = require("./utils/invoiceDuplicate");
 
 const Groq = require("groq-sdk");
 const crypto = require("crypto");
@@ -441,25 +442,115 @@ ${fullText}`
             const validation = validateInvoiceData(nestedInvoice);
             nestedInvoice.validation = validation;
 
-            // 7. Persist the structured invoice
-            await Invoice.findByIdAndUpdate(invoiceId, {
-                invoiceNumber: nestedInvoice.invoiceNumber,
-                vendor:        nestedInvoice.vendor,
-                date:          nestedInvoice.date,
-                tax:           nestedInvoice.tax,
-                total:         nestedInvoice.total,
-                lineItems:     nestedInvoice.lineItems,
-                validation:    nestedInvoice.validation,
-                review: {
-                    status: "pending",
-                    reviewedBy: null,
-                    reviewedAt: null,
-                    notes: null,
-                    corrections: {},
-                    validation: nestedInvoice.validation
-                },
-                status:        "extracted"
-            });
+            // 6.6 Duplicate Detection
+            const normKey = getNormalizedIdentityKey(nestedInvoice.vendor.value, nestedInvoice.invoiceNumber.value);
+            let duplicateInfo = {
+                isPossibleDuplicate: false,
+                duplicateOf: null,
+                status: "not_duplicate"
+            };
+
+            if (normKey) {
+                const lockKey = `lock:duplicate:${normKey}`;
+                let locked = false;
+                for (let i = 0; i < 15; i++) {
+                    const acquired = await redisConnection.set(lockKey, "locked", "NX", "EX", 10);
+                    if (acquired) {
+                        locked = true;
+                        break;
+                    }
+                    await new Promise(r => setTimeout(r, 200));
+                }
+
+                try {
+                    if (locked) {
+                        const match = await Invoice.findOne({ 
+                            normalizedIdentityKey: normKey, 
+                            _id: { $ne: invoiceId } 
+                        }).sort({ createdAt: -1 }).lean();
+
+                        if (match) {
+                            duplicateInfo = {
+                                isPossibleDuplicate: true,
+                                duplicateOf: match._id,
+                                status: "unresolved"
+                            };
+                        }
+                        
+                        // 7. Persist the structured invoice (INSIDE THE LOCK)
+                        await Invoice.findByIdAndUpdate(invoiceId, {
+                            invoiceNumber: nestedInvoice.invoiceNumber,
+                            vendor:        nestedInvoice.vendor,
+                            date:          nestedInvoice.date,
+                            tax:           nestedInvoice.tax,
+                            total:         nestedInvoice.total,
+                            lineItems:     nestedInvoice.lineItems,
+                            validation:    nestedInvoice.validation,
+                            review: {
+                                status: "pending",
+                                reviewedBy: null,
+                                reviewedAt: null,
+                                notes: null,
+                                corrections: {},
+                                validation: nestedInvoice.validation
+                            },
+                            normalizedIdentityKey: normKey,
+                            duplicate: duplicateInfo,
+                            status:        "extracted"
+                        });
+                        
+                    } else {
+                        console.warn(`Could not acquire duplicate lock for ${normKey}`);
+                        // Fallback save if we couldn't acquire lock (invoice must still be saved)
+                        await Invoice.findByIdAndUpdate(invoiceId, {
+                            invoiceNumber: nestedInvoice.invoiceNumber,
+                            vendor:        nestedInvoice.vendor,
+                            date:          nestedInvoice.date,
+                            tax:           nestedInvoice.tax,
+                            total:         nestedInvoice.total,
+                            lineItems:     nestedInvoice.lineItems,
+                            validation:    nestedInvoice.validation,
+                            review: {
+                                status: "pending",
+                                reviewedBy: null,
+                                reviewedAt: null,
+                                notes: null,
+                                corrections: {},
+                                validation: nestedInvoice.validation
+                            },
+                            normalizedIdentityKey: normKey,
+                            duplicate: duplicateInfo, // will be unresolved/not_duplicate as initialized
+                            status:        "extracted"
+                        });
+                    }
+                } finally {
+                    if (locked) {
+                        await redisConnection.del(lockKey);
+                    }
+                }
+            } else {
+                // If no normKey, just save it normally
+                await Invoice.findByIdAndUpdate(invoiceId, {
+                    invoiceNumber: nestedInvoice.invoiceNumber,
+                    vendor:        nestedInvoice.vendor,
+                    date:          nestedInvoice.date,
+                    tax:           nestedInvoice.tax,
+                    total:         nestedInvoice.total,
+                    lineItems:     nestedInvoice.lineItems,
+                    validation:    nestedInvoice.validation,
+                    review: {
+                        status: "pending",
+                        reviewedBy: null,
+                        reviewedAt: null,
+                        notes: null,
+                        corrections: {},
+                        validation: nestedInvoice.validation
+                    },
+                    normalizedIdentityKey: null,
+                    duplicate: duplicateInfo,
+                    status:        "extracted"
+                });
+            }
 
             // 8. Mark the Job complete and store extractedData
             await Job.findByIdAndUpdate(jobId, {

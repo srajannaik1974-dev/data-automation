@@ -134,6 +134,21 @@ const invoiceSchema = new mongoose.Schema(
             default: "extracting"
         },
 
+        // --- Duplicate Detection ---
+        normalizedIdentityKey: {
+            type: String,
+            default: null
+        },
+        duplicate: {
+            isPossibleDuplicate: { type: Boolean, default: false },
+            duplicateOf: { type: mongoose.Schema.Types.ObjectId, ref: "Invoice", default: null },
+            status: { 
+                type: String, 
+                enum: ["unresolved", "confirmed", "not_duplicate"],
+                default: "not_duplicate"
+            }
+        },
+
         // --- Optional error detail ---
         errorMessage: {
             type: String,
@@ -150,6 +165,10 @@ invoiceSchema.index({ documentId: 1 }, { unique: true });
 
 // Dashboard/list queries
 invoiceSchema.index({ userId: 1, status: 1 });
+
+// Duplicate detection lookup
+// Sparse because legacy invoices won't have it, and we don't want to index nulls unnecessarily
+invoiceSchema.index({ normalizedIdentityKey: 1 }, { sparse: true });
 
 const Invoice = mongoose.model("Invoice", invoiceSchema);
 

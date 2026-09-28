@@ -5,6 +5,8 @@ const Job = require("../models/Job");
 const Invoice = require("../models/Invoice");
 const pipelineQueue = require("../queues/pipelineQueue");
 const { validateInvoiceData } = require("../utils/invoiceValidator");
+const { getNormalizedIdentityKey } = require("../utils/invoiceDuplicate");
+const redisConnection = require("../config/redis");
 
 const router = express.Router();
 
@@ -272,13 +274,65 @@ router.patch("/:invoiceId/review", async (req, res) => {
         // Recalculate review validation
         invoice.review.validation = validateInvoiceData(effectiveData);
 
-        // Update status
-        if (invoice.review.status === "pending" || invoice.review.status === "rejected") {
-            invoice.review.status = "in_review";
-        }
+        // Recalculate duplicate identity
+        const normKey = getNormalizedIdentityKey(effectiveData.vendor.value, effectiveData.invoiceNumber.value);
+        if (normKey && invoice.normalizedIdentityKey !== normKey) {
+            invoice.normalizedIdentityKey = normKey;
+            
+            const lockKey = `lock:duplicate:${normKey}`;
+            let locked = false;
+            for (let i = 0; i < 15; i++) {
+                const acquired = await redisConnection.set(lockKey, "locked", "NX", "EX", 10);
+                if (acquired) {
+                    locked = true;
+                    break;
+                }
+                await new Promise(r => setTimeout(r, 200));
+            }
 
-        invoice.markModified('review.corrections');
-        await invoice.save();
+            try {
+                if (locked) {
+                    const match = await Invoice.findOne({ 
+                        normalizedIdentityKey: normKey, 
+                        _id: { $ne: invoiceId } 
+                    }).sort({ createdAt: -1 }).lean();
+
+                    if (match) {
+                        invoice.duplicate = {
+                            isPossibleDuplicate: true,
+                            duplicateOf: match._id,
+                            status: "unresolved"
+                        };
+                    } else {
+                        invoice.duplicate = {
+                            isPossibleDuplicate: false,
+                            duplicateOf: null,
+                            status: "not_duplicate"
+                        };
+                    }
+                    
+                    // Update status
+                    if (invoice.review.status === "pending" || invoice.review.status === "rejected") {
+                        invoice.review.status = "in_review";
+                    }
+
+                    invoice.markModified('review.corrections');
+                    await invoice.save();
+                }
+            } finally {
+                if (locked) {
+                    await redisConnection.del(lockKey);
+                }
+            }
+        } else {
+            // Update status
+            if (invoice.review.status === "pending" || invoice.review.status === "rejected") {
+                invoice.review.status = "in_review";
+            }
+
+            invoice.markModified('review.corrections');
+            await invoice.save();
+        }
 
         return res.status(200).json({
             invoiceId: invoice._id,
@@ -343,6 +397,10 @@ router.post("/:invoiceId/review/approve", async (req, res) => {
                 message: "Cannot approve invoice with unresolved validation errors.",
                 validationErrors: invoice.review.validation ? invoice.review.validation.errors : []
             });
+        }
+
+        if (invoice.duplicate && invoice.duplicate.isPossibleDuplicate && invoice.duplicate.status !== "not_duplicate") {
+            return res.status(409).json({ message: "Cannot approve invoice with unresolved duplicate warning." });
         }
 
         const resolvedUserId = req.body.userId || invoice.userId || "6aa9212244485686077972cd";
@@ -476,6 +534,43 @@ router.post("/:invoiceId/review/reject", async (req, res) => {
     } catch (error) {
         console.error("Reject invoice error:", error.message);
         return res.status(500).json({ message: "Failed to reject invoice" });
+    }
+});
+// ---------------------------------------------------------------------------
+// PATCH /api/invoice/:invoiceId/duplicate
+// Resolves a duplicate warning manually.
+// ---------------------------------------------------------------------------
+router.patch("/:invoiceId/duplicate", async (req, res) => {
+    try {
+        const { invoiceId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(invoiceId)) {
+            return res.status(400).json({ message: "Invalid invoiceId" });
+        }
+
+        const { status } = req.body;
+        if (status !== "confirmed" && status !== "not_duplicate") {
+            return res.status(400).json({ message: "Invalid duplicate resolution status" });
+        }
+
+        const invoice = await Invoice.findById(invoiceId);
+        if (!invoice) {
+            return res.status(404).json({ message: "Invoice not found" });
+        }
+
+        if (!invoice.duplicate || !invoice.duplicate.isPossibleDuplicate) {
+            return res.status(409).json({ message: "Invoice is not marked as a possible duplicate" });
+        }
+
+        invoice.duplicate.status = status;
+        await invoice.save();
+
+        return res.status(200).json({
+            invoiceId: invoice._id,
+            duplicate: invoice.duplicate
+        });
+    } catch (error) {
+        console.error("Duplicate resolution error:", error.message);
+        return res.status(500).json({ message: "Failed to resolve duplicate" });
     }
 });
 // ---------------------------------------------------------------------------
