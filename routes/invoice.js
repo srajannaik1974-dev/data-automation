@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const Document = require("../models/Document");
 const Job = require("../models/Job");
 const Invoice = require("../models/Invoice");
+const Batch = require("../models/Batch");
 const pipelineQueue = require("../queues/pipelineQueue");
 const { validateInvoiceData } = require("../utils/invoiceValidator");
 const { getNormalizedIdentityKey } = require("../utils/invoiceDuplicate");
@@ -256,6 +257,318 @@ router.get("/dashboard/invoices", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// POST /api/invoice/batch
+// Uploads multiple invoice PDFs and chains the processing pipeline.
+// ---------------------------------------------------------------------------
+router.post("/batch", upload.array("pdfs", 50), async (req, res) => {
+    try {
+        if (!req.files || req.files.length === 0) {
+            return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "PDF files are required" } });
+        }
+        
+        for (const file of req.files) {
+            if (file.mimetype !== "application/pdf") {
+                return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Only PDF files are allowed" } });
+            }
+            if (file.size > 10 * 1024 * 1024) {
+                return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "File size exceeds 10 MB limit" } });
+            }
+        }
+
+        const resolvedUserId = "6aa9212244485686077972cd";
+
+        const batch = await Batch.create({
+            userId: resolvedUserId,
+            totalInvoices: req.files.length,
+            processedInvoices: 0,
+            successfulInvoices: 0,
+            failedInvoices: 0,
+            status: "pending"
+        });
+
+        for (const file of req.files) {
+            const document = await Document.create({
+                userId: resolvedUserId,
+                originalName: file.originalname,
+                filePath: file.path,
+                mimeType: file.mimetype,
+                fileSize: file.size,
+                batchId: batch._id
+            });
+
+            const job = await Job.create({
+                userId: resolvedUserId,
+                documentId: document._id,
+                status: "pending",
+                batchId: batch._id
+            });
+
+            const invoice = await Invoice.create({
+                userId: resolvedUserId,
+                documentId: document._id,
+                jobId: job._id,
+                status: "extracting",
+                batchId: batch._id
+            });
+
+            const bullJob = await pipelineQueue.add(
+                "process-pdf",
+                {
+                    documentId: document._id.toString(),
+                    filePath: file.path,
+                    autoExtract: true,
+                    jobId: job._id.toString(),
+                    invoiceId: invoice._id.toString(),
+                    userId: resolvedUserId.toString(),
+                    batchId: batch._id.toString()
+                },
+                {
+                    attempts: 3,
+                    backoff: { type: "exponential", delay: 2000 }
+                }
+            );
+
+            job.bullJobId = bullJob.id;
+            await job.save();
+        }
+
+        return res.status(202).json({
+            message: "Batch processing started",
+            batchId: batch._id,
+            totalInvoices: batch.totalInvoices,
+            status: batch.status
+        });
+    } catch (error) {
+        console.error("Batch upload error:", error.message);
+        return res.status(500).json({ 
+            error: {
+                code: "INTERNAL_ERROR",
+                message: "Failed to upload batch"
+            }
+        });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/invoice/batches
+// Returns a paginated list of batches.
+// ---------------------------------------------------------------------------
+router.get("/batches", async (req, res) => {
+    try {
+        const resolvedUserId = "6aa9212244485686077972cd";
+
+        let page = 1;
+        let limit = 10;
+        if (req.query.page) {
+            page = parseInt(req.query.page, 10);
+            if (isNaN(page) || page < 1) {
+                return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid page parameter" } });
+            }
+        }
+        if (req.query.limit) {
+            limit = parseInt(req.query.limit, 10);
+            if (isNaN(limit) || limit < 1 || limit > 100) {
+                return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid limit parameter" } });
+            }
+        }
+
+        const skip = (page - 1) * limit;
+        const filter = { userId: new mongoose.Types.ObjectId(resolvedUserId) };
+
+        const total = await Batch.countDocuments(filter);
+        
+        let batches = [];
+        if (total > 0) {
+            batches = await Batch.find(filter)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .select({
+                    status: 1,
+                    totalInvoices: 1,
+                    processedInvoices: 1,
+                    successfulInvoices: 1,
+                    failedInvoices: 1,
+                    errorMessage: 1,
+                    createdAt: 1,
+                    updatedAt: 1
+                })
+                .lean();
+        }
+
+        const formattedBatches = batches.map(b => ({
+            batchId: b._id,
+            status: b.status,
+            totalInvoices: b.totalInvoices,
+            processedInvoices: b.processedInvoices,
+            successfulInvoices: b.successfulInvoices,
+            failedInvoices: b.failedInvoices,
+            errorMessage: b.errorMessage,
+            createdAt: b.createdAt,
+            updatedAt: b.updatedAt
+        }));
+
+        return res.status(200).json({
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit),
+            batches: formattedBatches
+        });
+
+    } catch (error) {
+        console.error("List batches error:", error.message);
+        return res.status(500).json({ 
+            error: {
+                code: "INTERNAL_ERROR",
+                message: "Failed to list batches"
+            }
+        });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/invoice/batch/:batchId
+// Returns the status of a specific batch.
+// ---------------------------------------------------------------------------
+router.get("/batch/:batchId", async (req, res) => {
+    try {
+        const { batchId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(batchId)) {
+            return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid batchId" } });
+        }
+
+        const resolvedUserId = "6aa9212244485686077972cd";
+
+        const batch = await Batch.findOne({ 
+            _id: batchId, 
+            userId: resolvedUserId 
+        }).lean();
+
+        if (!batch) {
+            return res.status(404).json({ error: { code: "NOT_FOUND", message: "Batch not found" } });
+        }
+
+        return res.status(200).json({
+            batchId: batch._id,
+            status: batch.status,
+            totalInvoices: batch.totalInvoices,
+            processedInvoices: batch.processedInvoices,
+            successfulInvoices: batch.successfulInvoices,
+            failedInvoices: batch.failedInvoices,
+            errorMessage: batch.errorMessage,
+            createdAt: batch.createdAt,
+            updatedAt: batch.updatedAt
+        });
+    } catch (error) {
+        console.error("Get batch error:", error.message);
+        return res.status(500).json({ 
+            error: {
+                code: "INTERNAL_ERROR",
+                message: "Failed to fetch batch"
+            }
+        });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/invoice/batch/:batchId/retry-failed
+// Retries failed invoices within a batch.
+// ---------------------------------------------------------------------------
+router.post("/batch/:batchId/retry-failed", async (req, res) => {
+    try {
+        const { batchId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(batchId)) {
+            return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid batchId" } });
+        }
+
+        const resolvedUserId = "6aa9212244485686077972cd";
+
+        const batch = await Batch.findOne({ 
+            _id: batchId, 
+            userId: resolvedUserId 
+        });
+
+        if (!batch) {
+            return res.status(404).json({ error: { code: "NOT_FOUND", message: "Batch not found" } });
+        }
+
+        const failedInvoices = await Invoice.find({
+            batchId: batch._id,
+            userId: resolvedUserId,
+            status: "failed"
+        });
+
+        if (failedInvoices.length === 0) {
+            return res.status(200).json({
+                message: "No failed invoices found to retry",
+                retriedCount: 0
+            });
+        }
+
+        let retriedCount = 0;
+        
+        for (const invoice of failedInvoices) {
+            const document = await Document.findOne({ _id: invoice.documentId });
+            const job = await Job.findOne({ _id: invoice.jobId });
+            
+            if (!document || !job) {
+                console.error(`Cannot retry invoice ${invoice._id}: missing document or job`);
+                continue;
+            }
+
+            job.status = "pending";
+            await job.save();
+
+            invoice.status = "extracting";
+            invoice.validation = undefined;
+            await invoice.save();
+
+            const bullJob = await pipelineQueue.add(
+                "process-pdf",
+                {
+                    documentId: document._id.toString(),
+                    filePath: document.filePath,
+                    autoExtract: true,
+                    jobId: job._id.toString(),
+                    invoiceId: invoice._id.toString(),
+                    userId: resolvedUserId.toString(),
+                    batchId: batch._id.toString()
+                },
+                {
+                    attempts: 3,
+                    backoff: { type: "exponential", delay: 2000 }
+                }
+            );
+
+            job.bullJobId = bullJob.id;
+            await job.save();
+            
+            retriedCount++;
+        }
+
+        batch.processedInvoices = Math.max(0, batch.processedInvoices - retriedCount);
+        batch.failedInvoices = Math.max(0, batch.failedInvoices - retriedCount);
+        batch.status = "processing";
+        await batch.save();
+
+        return res.status(202).json({
+            message: "Retry started for failed invoices",
+            batchId: batch._id,
+            retriedCount
+        });
+    } catch (error) {
+        console.error("Retry batch error:", error.message);
+        return res.status(500).json({ 
+            error: {
+                code: "INTERNAL_ERROR",
+                message: "Failed to retry batch"
+            }
+        });
+    }
+});
+
 // POST /api/invoice/upload
 // Uploads a single invoice PDF and auto-chains the processing pipeline.
 // ---------------------------------------------------------------------------
