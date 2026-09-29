@@ -9,6 +9,12 @@ const invoiceSchema = new mongoose.Schema(
             required: true
         },
 
+        batchId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Batch",
+            default: null
+        },
+
         documentId: {
             type: mongoose.Schema.Types.ObjectId,
             ref: "Document",
@@ -165,6 +171,10 @@ invoiceSchema.index({ documentId: 1 }, { unique: true });
 
 // Dashboard/list queries
 invoiceSchema.index({ userId: 1, status: 1 });
+invoiceSchema.index({ userId: 1, createdAt: -1 });
+
+// Batch retrieval
+invoiceSchema.index({ batchId: 1 });
 
 // Duplicate detection lookup
 // Sparse because legacy invoices won't have it, and we don't want to index nulls unnecessarily

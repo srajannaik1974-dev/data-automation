@@ -5,6 +5,11 @@ const jobSchema = new mongoose.Schema({
         ref: "User",
         required: true
     },
+    batchId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Batch",
+        default: null
+    },
 
     status: {
         type: String,

@@ -9,6 +9,8 @@ const Document = require("./models/Document");
 const Chunk = require("./models/Chunk");
 const PageImage = require("./models/PageImage");
 const Invoice = require("./models/Invoice");
+const Batch = require("./models/Batch");
+const pipelineQueue = require("./queues/pipelineQueue");
 const path = require("path");
 const { PNG } = require("pngjs");
 const { validateInvoiceData } = require("./utils/invoiceValidator");
@@ -98,7 +100,7 @@ const startWorker = async () => {
              if (job.name === "process-pdf") {
             console.log("Processing PDF job:", job.id);
 
-            const { documentId, filePath } = job.data;
+            const { documentId, filePath, autoExtract, jobId, invoiceId, userId, batchId } = job.data;
             await Document.findByIdAndUpdate(documentId, {
     status: "processing"
 });
@@ -261,6 +263,24 @@ await Document.findByIdAndUpdate(documentId, {
 
 await parser.destroy();
 
+if (autoExtract && jobId && invoiceId && userId) {
+    const bullJob = await pipelineQueue.add(
+        "process-invoice",
+        {
+            jobId,
+            invoiceId,
+            documentId,
+            userId,
+            batchId
+        },
+        {
+            attempts: 3,
+            backoff: { type: "exponential", delay: 2000 }
+        }
+    );
+    await Job.findByIdAndUpdate(jobId, { bullJobId: bullJob.id });
+}
+
             return {
                 success: true,
                 type: "pdf",
@@ -274,7 +294,7 @@ await parser.destroy();
         if (job.name === "process-invoice") {
             console.log("Processing invoice job:", job.id);
 
-            const { jobId, invoiceId, documentId, userId } = job.data;
+            const { jobId, invoiceId, documentId, userId, batchId } = job.data;
 
             await Job.findByIdAndUpdate(jobId, { status: "processing" });
 
@@ -559,6 +579,22 @@ ${fullText}`
                 isCachedResult: cachedResult ? true : false
             });
 
+            if (batchId) {
+                const updatedBatch = await Batch.findByIdAndUpdate(batchId, {
+                    $inc: { processedInvoices: 1, successfulInvoices: 1 }
+                }, { new: true });
+                
+                if (updatedBatch && updatedBatch.processedInvoices === updatedBatch.totalInvoices) {
+                    let finalStatus = "completed";
+                    if (updatedBatch.failedInvoices === updatedBatch.totalInvoices) {
+                        finalStatus = "failed";
+                    } else if (updatedBatch.failedInvoices > 0) {
+                        finalStatus = "partially_completed";
+                    }
+                    await Batch.findByIdAndUpdate(batchId, { status: finalStatus });
+                }
+            }
+
             console.log("Invoice extraction complete for invoiceId:", invoiceId);
 
             return {
@@ -694,6 +730,29 @@ await Job.findByIdAndUpdate(jobId, {
             status: "failed",
             errorMessage: error.message
         });
+
+        if (job.data.invoiceId) {
+            await Invoice.findByIdAndUpdate(job.data.invoiceId, {
+                status: "failed",
+                errorMessage: error.message
+            });
+        }
+        
+        if (job.data.batchId) {
+            const updatedBatch = await Batch.findByIdAndUpdate(job.data.batchId, {
+                $inc: { processedInvoices: 1, failedInvoices: 1 }
+            }, { new: true });
+            
+            if (updatedBatch && updatedBatch.processedInvoices === updatedBatch.totalInvoices) {
+                let finalStatus = "completed";
+                if (updatedBatch.failedInvoices === updatedBatch.totalInvoices) {
+                    finalStatus = "failed";
+                } else if (updatedBatch.failedInvoices > 0) {
+                    finalStatus = "partially_completed";
+                }
+                await Batch.findByIdAndUpdate(job.data.batchId, { status: finalStatus });
+            }
+        }
     }
 });
     

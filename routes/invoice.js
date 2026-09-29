@@ -10,6 +10,387 @@ const redisConnection = require("../config/redis");
 
 const router = express.Router();
 
+const multer = require("multer");
+const upload = multer({ dest: "uploads/" });
+
+// ---------------------------------------------------------------------------
+// GET /api/invoice/dashboard/stats
+// Returns compact statistics for the Invoice Dashboard.
+// ---------------------------------------------------------------------------
+router.get("/dashboard/stats", async (req, res) => {
+    try {
+        const resolvedUserId = "6aa9212244485686077972cd";
+        const userIdObj = new mongoose.Types.ObjectId(resolvedUserId);
+
+        const result = await Invoice.aggregate([
+            { $match: { userId: userIdObj } },
+            {
+                $facet: {
+                    totalInvoices: [{ $count: "count" }],
+                    pendingReview: [
+                        { $match: { "review.status": "pending" } },
+                        { $count: "count" }
+                    ],
+                    approved: [
+                        { $match: { "review.status": "approved" } },
+                        { $count: "count" }
+                    ],
+                    rejected: [
+                        { $match: { "review.status": "rejected" } },
+                        { $count: "count" }
+                    ],
+                    failed: [
+                        { $match: { status: "failed" } },
+                        { $count: "count" }
+                    ],
+                    duplicates: [
+                        { $match: { "duplicate.isPossibleDuplicate": true } },
+                        { $count: "count" }
+                    ]
+                }
+            }
+        ]);
+
+        const stats = {
+            totalInvoices: 0,
+            pendingReview: 0,
+            approved: 0,
+            rejected: 0,
+            failed: 0,
+            duplicates: 0
+        };
+
+        if (result && result.length > 0) {
+            const data = result[0];
+            stats.totalInvoices = data.totalInvoices[0] ? data.totalInvoices[0].count : 0;
+            stats.pendingReview = data.pendingReview[0] ? data.pendingReview[0].count : 0;
+            stats.approved = data.approved[0] ? data.approved[0].count : 0;
+            stats.rejected = data.rejected[0] ? data.rejected[0].count : 0;
+            stats.failed = data.failed[0] ? data.failed[0].count : 0;
+            stats.duplicates = data.duplicates[0] ? data.duplicates[0].count : 0;
+        }
+
+        return res.status(200).json(stats);
+    } catch (error) {
+        console.error("Dashboard stats error:", error.message);
+        return res.status(500).json({ 
+            error: {
+                code: "INTERNAL_ERROR",
+                message: "An unexpected error occurred"
+            }
+        });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/invoice/dashboard/invoices
+// Returns a paginated, filterable, and sortable list of invoices.
+// ---------------------------------------------------------------------------
+router.get("/dashboard/invoices", async (req, res) => {
+    try {
+        const resolvedUserId = "6aa9212244485686077972cd";
+
+        // 1. Pagination validation
+        let page = 1;
+        let limit = 10;
+        if (req.query.page) {
+            page = parseInt(req.query.page, 10);
+            if (isNaN(page) || page < 1) {
+                return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid page parameter" } });
+            }
+        }
+        if (req.query.limit) {
+            limit = parseInt(req.query.limit, 10);
+            if (isNaN(limit) || limit < 1 || limit > 100) {
+                return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid limit parameter. Must be between 1 and 100." } });
+            }
+        }
+
+        const skip = (page - 1) * limit;
+
+        // 2. Build Filter
+        const filter = { userId: new mongoose.Types.ObjectId(resolvedUserId) };
+
+        // Search
+        if (req.query.search && typeof req.query.search === "string") {
+            const searchRegex = new RegExp(req.query.search.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'i');
+            filter.$or = [
+                { "invoiceNumber.value": searchRegex },
+                { "vendor.value": searchRegex }
+            ];
+        }
+
+        // Status filter
+        if (req.query.status) {
+            const validStatuses = ["extracting", "extracted", "failed"];
+            if (!validStatuses.includes(req.query.status)) {
+                return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid status parameter" } });
+            }
+            filter.status = req.query.status;
+        }
+
+        // Review Status filter
+        if (req.query.reviewStatus) {
+            const validReviewStatuses = ["pending", "in_review", "approved", "rejected"];
+            if (!validReviewStatuses.includes(req.query.reviewStatus)) {
+                return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid reviewStatus parameter" } });
+            }
+            filter["review.status"] = req.query.reviewStatus;
+        }
+
+        // Duplicate filter
+        if (req.query.duplicate !== undefined) {
+            if (req.query.duplicate !== "true" && req.query.duplicate !== "false") {
+                return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid duplicate parameter. Must be true or false." } });
+            }
+            filter["duplicate.isPossibleDuplicate"] = req.query.duplicate === "true";
+        }
+
+        // 3. Sorting validation
+        let sortBy = req.query.sortBy || "createdAt";
+        let sortOrder = req.query.sortOrder || "desc";
+
+        const validSortFields = {
+            "createdAt": "createdAt",
+            "updatedAt": "updatedAt",
+            "date": "date.value",
+            "total": "total.value",
+            "invoiceNumber": "invoiceNumber.value",
+            "vendor": "vendor.value"
+        };
+
+        if (!validSortFields[sortBy]) {
+            return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid sortBy parameter" } });
+        }
+        
+        if (sortOrder !== "asc" && sortOrder !== "desc") {
+            return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid sortOrder parameter" } });
+        }
+
+        const sortConfig = {};
+        sortConfig[validSortFields[sortBy]] = sortOrder === "asc" ? 1 : -1;
+        // ensure deterministic sorting
+        if (sortBy !== "createdAt") sortConfig["createdAt"] = -1;
+
+        // 4. Projection (Compact response)
+        const projection = {
+            "invoiceNumber.value": 1,
+            "vendor.value": 1,
+            "date.value": 1,
+            "tax.value": 1,
+            "total.value": 1,
+            "status": 1,
+            "validation.isValid": 1,
+            "validation.missingFields": 1,
+            "validation.errors": 1,
+            "validation.warnings": 1,
+            "duplicate.isPossibleDuplicate": 1,
+            "duplicate.status": 1,
+            "review.status": 1,
+            "review.reviewedAt": 1,
+            "batchId": 1,
+            "createdAt": 1,
+            "updatedAt": 1
+        };
+
+        // 5. Execute Queries
+        const total = await Invoice.countDocuments(filter);
+        
+        let invoices = [];
+        if (total > 0) {
+            invoices = await Invoice.find(filter)
+                .sort(sortConfig)
+                .skip(skip)
+                .limit(limit)
+                .select(projection)
+                .lean();
+        }
+
+        // 6. Format Response
+        const formattedInvoices = invoices.map(inv => {
+            return {
+                invoiceId: inv._id,
+                invoiceNumber: inv.invoiceNumber?.value || null,
+                vendor: inv.vendor?.value || null,
+                date: inv.date?.value || null,
+                tax: inv.tax?.value || null,
+                total: inv.total?.value || null,
+                status: inv.status,
+                validation: {
+                    isValid: inv.validation?.isValid || false,
+                    missingFields: inv.validation?.missingFields || [],
+                    errorCount: inv.validation?.errors ? inv.validation.errors.length : 0,
+                    warningCount: inv.validation?.warnings ? inv.validation.warnings.length : 0
+                },
+                duplicate: {
+                    isPossibleDuplicate: inv.duplicate?.isPossibleDuplicate || false,
+                    status: inv.duplicate?.status || "not_duplicate"
+                },
+                review: {
+                    status: inv.review?.status || "pending",
+                    reviewedAt: inv.review?.reviewedAt || null
+                },
+                batchId: inv.batchId || null,
+                createdAt: inv.createdAt,
+                updatedAt: inv.updatedAt
+            };
+        });
+
+        return res.status(200).json({
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit),
+            invoices: formattedInvoices
+        });
+
+    } catch (error) {
+        console.error("Dashboard invoices error:", error.message);
+        return res.status(500).json({ 
+            error: {
+                code: "INTERNAL_ERROR",
+                message: "An unexpected error occurred"
+            }
+        });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/invoice/upload
+// Uploads a single invoice PDF and auto-chains the processing pipeline.
+// ---------------------------------------------------------------------------
+router.post("/upload", upload.single("pdf"), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ message: "PDF file is required" });
+        }
+        if (req.file.mimetype !== "application/pdf") {
+            return res.status(400).json({ message: "Only PDF files are allowed" });
+        }
+        if (req.file.size > 10 * 1024 * 1024) {
+            return res.status(400).json({ message: "File size exceeds 10 MB limit" });
+        }
+
+        const resolvedUserId = "6aa9212244485686077972cd";
+
+        const document = await Document.create({
+            userId: resolvedUserId,
+            originalName: req.file.originalname,
+            filePath: req.file.path,
+            mimeType: req.file.mimetype,
+            fileSize: req.file.size,
+            batchId: null
+        });
+
+        const job = await Job.create({
+            userId: resolvedUserId,
+            documentId: document._id,
+            status: "pending",
+            batchId: null
+        });
+
+        const invoice = await Invoice.create({
+            userId: resolvedUserId,
+            documentId: document._id,
+            jobId: job._id,
+            status: "extracting",
+            batchId: null
+        });
+        
+        const bullJob = await pipelineQueue.add(
+            "process-pdf",
+            {
+                documentId: document._id.toString(),
+                filePath: req.file.path,
+                autoExtract: true,
+                jobId: job._id.toString(),
+                invoiceId: invoice._id.toString(),
+                userId: resolvedUserId.toString(),
+                batchId: null
+            },
+            {
+                attempts: 3,
+                backoff: { type: "exponential", delay: 2000 }
+            }
+        );
+
+        job.bullJobId = bullJob.id;
+        await job.save();
+
+        return res.status(202).json({
+            message: "Invoice processing started",
+            invoiceId: invoice._id,
+            documentId: document._id,
+            jobId: job._id,
+            status: "pending"
+        });
+    } catch (error) {
+        console.error("Single invoice upload error:", error.message);
+        return res.status(500).json({ message: "Failed to upload invoice" });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/invoice/:invoiceId/status
+// Read-only endpoint for checking the processing status of a single invoice.
+// ---------------------------------------------------------------------------
+router.get("/:invoiceId/status", async (req, res) => {
+    try {
+        const { invoiceId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(invoiceId)) {
+            return res.status(400).json({ message: "Invalid invoiceId" });
+        }
+
+        const resolvedUserId = "6aa9212244485686077972cd";
+
+        const invoice = await Invoice.findOne({ 
+            _id: invoiceId, 
+            userId: resolvedUserId 
+        }).lean();
+
+        if (!invoice) {
+            return res.status(404).json({ message: "Invoice not found" });
+        }
+
+        const job = await Job.findOne({ _id: invoice.jobId, userId: resolvedUserId }).lean();
+        
+        let overallStatus = "processing";
+        if (job) {
+            if (job.status === "failed" || invoice.status === "failed") {
+                overallStatus = "failed";
+            } else if (job.status === "completed" && invoice.status === "extracted") {
+                overallStatus = "completed";
+            } else if (job.status === "pending" && invoice.status === "extracting") {
+                overallStatus = "queued";
+            }
+        } else if (invoice.status === "failed") {
+            overallStatus = "failed";
+        } else if (invoice.status === "extracted") {
+            overallStatus = "completed";
+        }
+
+        return res.status(200).json({
+            invoiceId: invoice._id,
+            jobId: invoice.jobId,
+            status: overallStatus,
+            invoiceStatus: invoice.status,
+            reviewStatus: invoice.review ? invoice.review.status : "pending",
+            validation: invoice.validation || {
+                isValid: true,
+                errorCount: 0,
+                warningCount: 0
+            },
+            duplicate: invoice.duplicate || {
+                isPossibleDuplicate: false,
+                status: "not_duplicate"
+            }
+        });
+    } catch (error) {
+        console.error("Get invoice status error:", error.message);
+        return res.status(500).json({ message: "Failed to fetch status" });
+    }
+});
+
 // ---------------------------------------------------------------------------
 // POST /api/invoice/extract
 // Accepts { documentId } for a PDF that has already been processed by
@@ -744,5 +1125,7 @@ router.get("/:invoiceId/export/csv", async (req, res) => {
         return res.status(500).json({ message: "Failed to export invoice as CSV" });
     }
 });
+
+module.exports = router;
 
 module.exports = router;
