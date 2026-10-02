@@ -2,8 +2,11 @@ const express = require("express");
 const multer = require("multer");
 const Document = require("../models/Document");
 const pipelineQueue = require("../queues/pipelineQueue");
+const auth = require("../middleware/auth");
 
 const router = express.Router();
+
+router.use(auth);
 
 const upload = multer({
     dest: "uploads/"
@@ -18,7 +21,7 @@ router.post("/upload", upload.single("pdf"), async (req, res) => {
         }
 
         const document = await Document.create({
-            userId: "6aa9212244485686077972cd",
+            userId: req.user._id,
             originalName: req.file.originalname,
             filePath: req.file.path,
             mimeType: req.file.mimetype,

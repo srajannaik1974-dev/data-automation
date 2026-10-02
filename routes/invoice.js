@@ -8,8 +8,11 @@ const pipelineQueue = require("../queues/pipelineQueue");
 const { validateInvoiceData } = require("../utils/invoiceValidator");
 const { getNormalizedIdentityKey } = require("../utils/invoiceDuplicate");
 const redisConnection = require("../config/redis");
+const auth = require("../middleware/auth");
 
 const router = express.Router();
+
+router.use(auth);
 
 const multer = require("multer");
 const upload = multer({ dest: "uploads/" });
@@ -20,7 +23,7 @@ const upload = multer({ dest: "uploads/" });
 // ---------------------------------------------------------------------------
 router.get("/dashboard/stats", async (req, res) => {
     try {
-        const resolvedUserId = "6aa9212244485686077972cd";
+        const resolvedUserId = req.user._id;
         const userIdObj = new mongoose.Types.ObjectId(resolvedUserId);
 
         const result = await Invoice.aggregate([
@@ -89,7 +92,7 @@ router.get("/dashboard/stats", async (req, res) => {
 // ---------------------------------------------------------------------------
 router.get("/dashboard/invoices", async (req, res) => {
     try {
-        const resolvedUserId = "6aa9212244485686077972cd";
+        const resolvedUserId = req.user._id;
 
         // 1. Pagination validation
         let page = 1;
@@ -276,7 +279,7 @@ router.post("/batch", upload.array("pdfs", 50), async (req, res) => {
             }
         }
 
-        const resolvedUserId = "6aa9212244485686077972cd";
+        const resolvedUserId = req.user._id;
 
         const batch = await Batch.create({
             userId: resolvedUserId,
@@ -356,7 +359,7 @@ router.post("/batch", upload.array("pdfs", 50), async (req, res) => {
 // ---------------------------------------------------------------------------
 router.get("/batches", async (req, res) => {
     try {
-        const resolvedUserId = "6aa9212244485686077972cd";
+        const resolvedUserId = req.user._id;
 
         let page = 1;
         let limit = 10;
@@ -439,7 +442,7 @@ router.get("/batch/:batchId", async (req, res) => {
             return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid batchId" } });
         }
 
-        const resolvedUserId = "6aa9212244485686077972cd";
+        const resolvedUserId = req.user._id;
 
         const batch = await Batch.findOne({ 
             _id: batchId, 
@@ -483,7 +486,7 @@ router.post("/batch/:batchId/retry-failed", async (req, res) => {
             return res.status(400).json({ error: { code: "INVALID_PARAMETER", message: "Invalid batchId" } });
         }
 
-        const resolvedUserId = "6aa9212244485686077972cd";
+        const resolvedUserId = req.user._id;
 
         const batch = await Batch.findOne({ 
             _id: batchId, 
@@ -584,7 +587,7 @@ router.post("/upload", upload.single("pdf"), async (req, res) => {
             return res.status(400).json({ message: "File size exceeds 10 MB limit" });
         }
 
-        const resolvedUserId = "6aa9212244485686077972cd";
+        const resolvedUserId = req.user._id;
 
         const document = await Document.create({
             userId: resolvedUserId,
@@ -654,7 +657,7 @@ router.get("/:invoiceId/status", async (req, res) => {
             return res.status(400).json({ message: "Invalid invoiceId" });
         }
 
-        const resolvedUserId = "6aa9212244485686077972cd";
+        const resolvedUserId = req.user._id;
 
         const invoice = await Invoice.findOne({ 
             _id: invoiceId, 
@@ -724,14 +727,14 @@ router.post("/extract", async (req, res) => {
 
         // Resolve userId: accept from body or fall back to the dev placeholder
         // that already exists in the project (same pattern as routes/pdf.js).
-        const resolvedUserId = userId || "6aa9212244485686077972cd";
+        const resolvedUserId = req.user._id;
 
         if (!mongoose.Types.ObjectId.isValid(resolvedUserId)) {
             return res.status(400).json({ message: "Invalid userId" });
         }
 
         // Verify the document exists and has been fully processed
-        const document = await Document.findById(documentId).lean();
+        const document = await Document.findOne({ _id: documentId, userId: req.user._id }).lean();
 
         if (!document) {
             return res.status(404).json({ message: "Document not found" });
@@ -820,7 +823,7 @@ router.get("/:invoiceId", async (req, res) => {
             return res.status(400).json({ message: "Invalid invoiceId" });
         }
 
-        const invoice = await Invoice.findById(invoiceId).lean();
+        const invoice = await Invoice.findOne({ _id: invoiceId, userId: req.user._id }).lean();
 
         if (!invoice) {
             return res.status(404).json({ message: "Invoice not found" });
@@ -868,7 +871,7 @@ router.get("/:invoiceId/review", async (req, res) => {
             return res.status(400).json({ message: "Invalid invoiceId" });
         }
 
-        const invoice = await Invoice.findById(invoiceId).lean();
+        const invoice = await Invoice.findOne({ _id: invoiceId, userId: req.user._id }).lean();
 
         if (!invoice) {
             return res.status(404).json({ message: "Invoice not found" });
@@ -927,7 +930,7 @@ router.patch("/:invoiceId/review", async (req, res) => {
             }
         }
 
-        const invoice = await Invoice.findById(invoiceId);
+        const invoice = await Invoice.findOne({ _id: invoiceId, userId: req.user._id });
         if (!invoice) {
             return res.status(404).json({ message: "Invoice not found" });
         }
@@ -1073,7 +1076,7 @@ router.post("/:invoiceId/review/approve", async (req, res) => {
             return res.status(400).json({ message: "Invalid invoiceId" });
         }
 
-        const invoice = await Invoice.findById(invoiceId);
+        const invoice = await Invoice.findOne({ _id: invoiceId, userId: req.user._id });
         if (!invoice) {
             return res.status(404).json({ message: "Invoice not found" });
         }
@@ -1097,7 +1100,7 @@ router.post("/:invoiceId/review/approve", async (req, res) => {
             return res.status(409).json({ message: "Cannot approve invoice with unresolved duplicate warning." });
         }
 
-        const resolvedUserId = req.body.userId || invoice.userId || "6aa9212244485686077972cd";
+        const resolvedUserId = req.user._id;
 
         invoice.review.status = "approved";
         invoice.review.reviewedBy = resolvedUserId;
@@ -1165,7 +1168,7 @@ router.post("/:invoiceId/review/reject", async (req, res) => {
         }
         const trimmedReason = reason.trim();
 
-        const invoice = await Invoice.findById(invoiceId);
+        const invoice = await Invoice.findOne({ _id: invoiceId, userId: req.user._id });
         if (!invoice) {
             return res.status(404).json({ message: "Invoice not found" });
         }
@@ -1178,7 +1181,7 @@ router.post("/:invoiceId/review/reject", async (req, res) => {
             return res.status(409).json({ message: "Invoice is already rejected" });
         }
 
-        const resolvedUserId = req.body.userId || invoice.userId || "6aa9212244485686077972cd";
+        const resolvedUserId = req.user._id;
 
         invoice.review.status = "rejected";
         invoice.review.notes = trimmedReason;
@@ -1246,7 +1249,7 @@ router.patch("/:invoiceId/duplicate", async (req, res) => {
             return res.status(400).json({ message: "Invalid duplicate resolution status" });
         }
 
-        const invoice = await Invoice.findById(invoiceId);
+        const invoice = await Invoice.findOne({ _id: invoiceId, userId: req.user._id });
         if (!invoice) {
             return res.status(404).json({ message: "Invoice not found" });
         }
@@ -1280,7 +1283,7 @@ router.get("/:invoiceId/export/json", async (req, res) => {
             return res.status(400).json({ message: "Invalid invoiceId" });
         }
 
-        const invoice = await Invoice.findById(invoiceId).lean();
+        const invoice = await Invoice.findOne({ _id: invoiceId, userId: req.user._id }).lean();
         if (!invoice) {
             return res.status(404).json({ message: "Invoice not found" });
         }
@@ -1357,7 +1360,7 @@ router.get("/:invoiceId/export/csv", async (req, res) => {
             return res.status(400).json({ message: "Invalid invoiceId" });
         }
 
-        const invoice = await Invoice.findById(invoiceId).lean();
+        const invoice = await Invoice.findOne({ _id: invoiceId, userId: req.user._id }).lean();
         if (!invoice) {
             return res.status(404).json({ message: "Invoice not found" });
         }

@@ -4,6 +4,7 @@ const connectDB = require("./config/db");
 const redisConnection = require("./config/redis");
 
 const pipelineRoutes = require("./routes/pipeline");
+const authRoutes = require("./routes/auth");
 
 const express = require("express");
 
@@ -28,6 +29,7 @@ app.use("/api/pdf", pdfRoutes);
 app.use("/api/qa", qaRoutes);
 
 app.use("/api/invoice", invoiceRoutes);
+app.use("/api/auth", authRoutes);
 
 const PORT = 5000;
 
